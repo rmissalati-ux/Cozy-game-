@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cozy Clicker Farm</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- GLOBAL VARIABLES & FIREBASE SETUP ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        let app;
+        let db;
+        let auth;
+        let userId = 'loading';
+        let isAuthReady = false;
+
+        const GRID_SIZE = 4; // 4x4 Farm Plot
+        const TILE_SIZE = 80;
+
+        // Tile States
+        const TILE_GRASS = 0;
+        const TILE_TILLED = 1;
+        const TILE_SEEDED = 2; 
+        const TILE_GROWING = 3; 
+        const TILE_HARVESTABLE = 4; 
+
+        // Initial Game State
+        let farmState = Array(GRID_SIZE * GRID_SIZE).fill(TILE_GRASS);
+        let inventory = { money: 100, seeds: 10, pumpkins: 0 };
+        const FARM_STATE_DOC_PATH = (uid) => `artifacts/${appId}/users/${uid}/gameData/clickerFarm`;
+        
+
+        // --- FIREBASE INITIALIZATION ---
+
+        function initializeGame() {
+            if (firebaseConfig) {
+                setLogLevel('debug');
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+            } else {
+                 console.error("Firebase config not found. Running in local-only mode.");
+                 isAuthReady = true;
+                 startLoops();
+                 return;
+            }
+            
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    isAuthReady = true;
+                    document.getElementById('userIdDisplay').textContent = `User ID: ${userId}`;
+                    await loadState(userId);
+                } else if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken).catch(() => signInAnonymously(auth));
+                } else {
+                    await signInAnonymously(auth).catch((e) => console.error("Anonymous sign-in failed:", e));
+                }
+            });
+        }
+        
+        async function loadState(uid) {
+            const docRef = doc(db, FARM_STATE_DOC_PATH(uid));
+            try {
+                onSnapshot(docRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        // Use JSON.parse for complex array structure
+                        try { farmState = JSON.parse(data.farmState); } catch(e) {}
+                        inventory = { ...inventory, ...data.inventory };
+                    } else {
+                        setDoc(docRef, createSaveState(), { merge: false });
+                    }
+                    if (!window.gameLoopsStarted) {
+                        startLoops(); 
+                        window.gameLoopsStarted = true;
+                    }
+                });
+            } catch (e) {
+                console.error("Error setting up snapshot listener:", e);
+                if (!window.gameLoopsStarted) {
+                    startLoops();
+                    window.gameLoopsStarted = true;
+                }
+            }
+        }
+        
+        function createSaveState() {
+             return {
+                inventory: inventory,
+                farmState: JSON.stringify(farmState), // Store complex array as JSON string
+                lastSaved: new Date().toISOString()
+            };
+        }
+
+        async function saveStateToFirestore() {
+            if (!isAuthReady || !userId || !db) return;
+            const docRef = doc(db, FARM_STATE_DOC_PATH(userId));
+            try {
+                await updateDoc(docRef, createSaveState());
+            } catch (e) {
+                if (e.code === 'not-found') {
+                    await setDoc(docRef, createSaveState(), { merge: false });
+                }
+            }
+        }
+        
+        // --- GAME LOGIC ---
+
+        window.handleTileClick = (index) => {
+            if (!isAuthReady) return;
+
+            let tile = farmState[index];
+            let stateChanged = false;
+
+            // FSM: Farm State Machine
+            switch (tile) {
+                case TILE_GRASS:
+                    farmState[index] = TILE_TILLED; // Till
+                    stateChanged = true;
+                    break;
+                case TILE_TILLED:
+                    if (inventory.seeds > 0) {
+                        inventory.seeds--;
+                        farmState[index] = TILE_SEEDED; // Plant
+                        stateChanged = true;
+                    }
+                    break;
+                case TILE_HARVESTABLE:
+                    inventory.pumpkins++;
+                    inventory.money += 10;
+                    farmState[index] = TILE_GRASS; // Harvest
+                    stateChanged = true;
+                    break;
+                case TILE_SEEDED:
+                case TILE_GROWING:
+                    // Cannot click growing crops, they need time
+                    break;
+            }
+
+            if (stateChanged) {
+                updateUI();
+                saveStateToFirestore();
+            }
+        };
+        
+        window.buySeeds = () => {
+            const SEED_PRICE = 5;
+            const SEEDS_BOUGHT = 5;
+            if (inventory.money >= SEED_PRICE) {
+                inventory.money -= SEED_PRICE;
+                inventory.seeds += SEEDS_BOUGHT;
+                updateUI();
+                saveStateToFirestore();
+            }
+        };
+
+
+        // --- RENDERING & LOOPS ---
+
+        function getTileContent(tileType) {
+            switch (tileType) {
+                case TILE_GRASS: return { text: '🌾', color: 'bg-green-600', hover: 'hover:bg-green-500' };
+                case TILE_TILLED: return { text: '🕳️', color: 'bg-yellow-800', hover: 'hover:bg-yellow-700' };
+                case TILE_SEEDED: return { text: '🌱', color: 'bg-yellow-800', hover: '' };
+                case TILE_GROWING: return { text: '🌿', color: 'bg-yellow-800', hover: '' };
+                case TILE_HARVESTABLE: return { text: '🎃', color: 'bg-yellow-800', hover: 'hover:ring-4 hover:ring-yellow-400' };
+                default: return { text: '', color: 'bg-green-600', hover: '' };
+            }
+        }
+
+        function updateUI() {
+            const farmGrid = document.getElementById('farmGrid');
+            farmGrid.innerHTML = ''; // Clear the grid
+
+            farmState.forEach((tileType, index) => {
+                const content = getTileContent(tileType);
+                const tileElement = document.createElement('div');
+                tileElement.onclick = () => window.handleTileClick(index);
+                
+                tileElement.className = `
+                    tile-element flex items-center justify-center p-2 text-3xl font-bold 
+                    rounded-lg shadow-inner cursor-pointer transition duration-150 ease-in-out 
+                    ${content.color} ${content.hover}
+                `;
+                tileElement.innerHTML = content.text;
+                farmGrid.appendChild(tileElement);
+            });
+            
+            // Update Inventory Display
+            document.getElementById('inventoryDisplay').innerHTML = `
+                <span class="p-2 bg-gray-700 rounded-lg shadow-md">💰 ${inventory.money} Gold</span>
+                <span class="p-2 bg-gray-700 rounded-lg shadow-md">🌰 ${inventory.seeds} Seeds</span>
+                <span class="p-2 bg-gray-700 rounded-lg shadow-md">🎃 ${inventory.pumpkins} Pumpkins</span>
+            `;
+
+            // Update Buy Seeds button state
+            const buyButton = document.getElementById('buySeedsButton');
+            buyButton.disabled = inventory.money < 5;
+            buyButton.className = `p-3 w-full rounded-md shadow-md transition duration-150 ${inventory.money >= 5 ? 'bg-yellow-600 hover:bg-yellow-500' : 'bg-gray-500 cursor-not-allowed'}`;
+        }
+        
+        function growthLoop() {
+            if (!isAuthReady) return;
+
+            let changesMade = false;
+            farmState = farmState.map(tile => {
+                if (tile === TILE_SEEDED) {
+                    changesMade = true;
+                    return TILE_GROWING; 
+                }
+                if (tile === TILE_GROWING) {
+                    changesMade = true;
+                    return TILE_HARVESTABLE;
+                }
+                return tile;
+            });
+
+            if (changesMade) {
+                updateUI();
+                saveStateToFirestore();
+            }
+            // Crops grow every 5 seconds
+            setTimeout(growthLoop, 5000); 
+        }
+
+        function startLoops() {
+            updateUI(); // Initial render
+            growthLoop();
+        }
+
+
+        // Initialize on window load
+        window.onload = initializeGame;
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400..700&display=swap');
+        
+        body {
+            font-family: 'Pixelify Sans', monospace;
+            background-color: #2c3e50;
+            color: #ecf0f1;
+            min-height: 100vh; 
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 1rem;
+        }
+
+        .pixel-border {
+            border: 4px solid #f39c12; 
+            box-shadow: 
+                4px 4px 0 #e67e22, 
+                -4px -4px 0 #f1c40f; 
+            border-radius: 8px;
+        }
+
+        #farmGrid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            width: min(90vw, 360px); /* Responsive size for 4x4 grid */
+            height: min(90vw, 360px);
+            margin-bottom: 2rem;
+            background-color: #7f8c8d;
+            padding: 8px;
+        }
+
+        .tile-element {
+            height: 100%;
+            width: 100%;
+            /* Custom pixel effect for tiles */
+            box-shadow: 2px 2px 0 rgba(0,0,0,0.3);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+        }
+    </style>
+</head>
+<body class="space-y-6">
+
+    <header class="text-center w-full max-w-lg">
+        <h1 class="text-4xl text-white mb-2">Cozy Clicker Farm 🥕</h1>
+        <p class="text-xl text-yellow-300">Tap to Till, Plant, or Harvest!</p>
+        <p id="userIdDisplay" class="text-sm text-gray-400"></p>
+    </header>
+
+    <!-- Inventory -->
+    <div id="inventoryDisplay" class="flex flex-wrap justify-center gap-3 p-4 pixel-border bg-gray-800 w-full max-w-md">
+        <!-- Inventory items updated by JS -->
+    </div>
+    
+    <!-- Farm Grid -->
+    <div id="farmGrid" class="pixel-border">
+        <!-- Farm tiles updated by JS -->
+    </div>
+
+    <!-- Actions -->
+    <div class="w-full max-w-md p-4 pixel-border bg-gray-800">
+        <button id="buySeedsButton" onclick="window.buySeeds()" class="p-3 w-full rounded-md shadow-md transition duration-150">
+            Buy Seeds (5 Gold / 5 Seeds)
+        </button>
+    </div>
+
+
+</body>
+</html>
+
